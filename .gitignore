@@ -1,0 +1,14 @@
+# Foundry
+out/
+cache/
+broadcast/
+
+# Node / Vite (app/)
+node_modules/
+app/dist/
+*.log
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
