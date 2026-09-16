@@ -12,6 +12,10 @@ export type NodeId = "dep" | "vault" | "bor" | "broker";
 
 export interface FlowEvent {
   from: NodeId; to: NodeId; text: string; cls?: "gain" | "loss" | ""; key: number;
+  /** Label shown once the packet reaches `to`, i.e. the same transfer seen from the
+   *  receiving side (−50,000 leaving the depositor is +50,000 arriving at the Vault).
+   *  Omitted for flows that carry no sign. */
+  textTo?: string;
 }
 
 export interface Step { title: string; desc: string; }

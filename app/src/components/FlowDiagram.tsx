@@ -45,13 +45,16 @@ export function FlowDiagram({ snap, flow, defaulted }: { snap: Snapshot | null; 
     refs[flow.from].current?.classList.add("hot");
     refs[flow.to].current?.classList.add("hot");
     requestAnimationFrame(() => { p.style.opacity = "1"; p.style.left = b.x + "px"; p.style.top = b.y + "px"; });
+    // Past the midpoint of the .95s travel the packet belongs to the receiver, so it flips to
+    // the receiving side's sign.
+    const t0 = flow.textTo ? setTimeout(() => { p.textContent = flow.textTo!; }, 520) : undefined;
     const t1 = setTimeout(() => { p.style.opacity = "0"; }, 1050);
     const t2 = setTimeout(() => {
       p.remove();
       refs[flow.from].current?.classList.remove("hot");
       refs[flow.to].current?.classList.remove("hot");
     }, 1350);
-    return () => { clearTimeout(t1); clearTimeout(t2); p.remove(); };
+    return () => { clearTimeout(t0); clearTimeout(t1); clearTimeout(t2); p.remove(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [flow?.key]);
 

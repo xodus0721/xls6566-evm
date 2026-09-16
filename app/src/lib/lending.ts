@@ -33,6 +33,29 @@ export const N = (v: bigint) => Number(ethers.formatUnits(v, 18));
 export const fmt = (v: bigint) => N(v).toLocaleString(undefined, { maximumFractionDigits: 2 });
 export const short = (a: string) => a.slice(0, 6) + "…" + a.slice(-4);
 
+const IFACES: Array<[string, ethers.Interface]> = [
+  ["Vault", new ethers.Interface((ART as any).vault.abi)],
+  ["LoanBroker", new ethers.Interface((ART as any).broker.abi)],
+  ["dUSD", new ethers.Interface((ART as any).token.abi)],
+];
+
+/** ethers decodes a revert only against the ABI of the contract it called, so a Vault error
+ *  raised inside a LoanBroker call surfaces as "unknown custom error". Try every ABI we have,
+ *  and fall back to the raw selector so an unrecognised revert is still identifiable. */
+export function explainError(e: any): string {
+  const data = e?.data ?? e?.revert?.data ?? e?.info?.error?.data ?? e?.error?.data;
+  if (typeof data === "string" && data.length > 2) {
+    for (const [name, iface] of IFACES) {
+      try {
+        const d = iface.parseError(data);
+        if (d) return `${d.name}(${d.args.map(String).join(", ")}) · ${name}`;
+      } catch { /* not this ABI */ }
+    }
+    return `${e.shortMessage || e.message} · selector ${data.slice(0, 10)}`;
+  }
+  return e?.shortMessage || e?.message || String(e);
+}
+
 export interface Snapshot {
   vaultTotal: number; onLoan: number; loss: number; cover: number; debt: number; maxWithdraw: number;
   balDep: number; balBor: number; balBrk: number;
@@ -45,7 +68,12 @@ export interface Snapshot {
 export const HARNESS = {
   alpha: 5n * 10n ** 17n, // 50% single-loan
   alphaBorrower: 5n * 10n ** 17n, // 50% per-borrower
-  debtFloor: U(60000), // D_floor
+  // D_floor sets the cap for a young book: loanCap = alpha x max(debt, D_floor) = 35,000 here.
+  // It has to clear scenario A's *principal plus interest* (30,000 @ 12% over 3 payments =
+  // 30,588 — the cap applies to debt, not principal) while still blocking scenario C's
+  // oversized 45,000 loan. At 60,000 the cap was exactly A's principal, so A could never run
+  // with the harness on.
+  debtFloor: U(70000), // D_floor
   lockDuration: 60n, // T_lock seconds
   lambda: 10n ** 18n, // λ = 1.0
 };
