@@ -11,6 +11,7 @@ declare global {
 export const SEPOLIA = 11155111n;
 const CHAIN_HEX = "0xaa36a7";
 const RPC = (typeof window !== "undefined" && window.DEMO_RPC) || "https://ethereum-sepolia-rpc.publicnode.com";
+const POLL_MS = 1000; // receipt poll interval (ethers default is 4000)
 const DEADLINE = 4102444800;
 const RATE = { late: 24000, close: 2000 };
 const FUND = { broker: "0.06", each: "0.01" };
@@ -79,9 +80,12 @@ export class LendingClient {
       await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: CHAIN_HEX }] });
       bp = new ethers.BrowserProvider(window.ethereum);
     }
+    // The demo runs 30+ sequential transactions; the default 4s receipt poll adds up.
+    bp.pollingInterval = POLL_MS;
     this.funder = await bp.getSigner();
     this.account = await this.funder.getAddress();
-    this.ro = new ethers.JsonRpcProvider(RPC);
+    this.ro = new ethers.JsonRpcProvider(RPC, SEPOLIA, { staticNetwork: true });
+    this.ro.pollingInterval = POLL_MS;
     this.loadWallets();
     return this.account;
   }
@@ -153,27 +157,42 @@ export class LendingClient {
     const K = await new ethers.ContractFactory((ART as any).broker.abi, (ART as any).broker.bytecode, B)
       .deploy(await V.getAddress(), B.address, 0n, 1000n, 10000n, 100000n, 0n);
     await K.waitForDeployment();
-    onStatus("권한 설정…");
-    await (await (V as any).grantRole(await (V as any).PROTOCOL_ROLE(), await K.getAddress())).wait();
+    const tokenAddr = await T.getAddress();
+    const vaultAddr = await V.getAddress();
+    const brokerAddr = await K.getAddress();
+
+    // Everything below is broker-signed and mutually independent, so the transactions go out
+    // together and are only awaited at the end — one block instead of one per call. NonceManager
+    // hands out distinct nonces for the concurrent sends.
+    onStatus("권한 설정 · 가스 충전 · dUSD 지급…");
+    const BN = new ethers.NonceManager(B);
+    const Tb = (T as any).connect(BN);
+    const batch: Promise<any>[] = [
+      (V as any).connect(BN).grantRole(await (V as any).PROTOCOL_ROLE(), brokerAddr),
+      BN.sendTransaction({ to: this.W.depositor.address, value: ethers.parseEther(FUND.each) }),
+      BN.sendTransaction({ to: this.W.borrower.address, value: ethers.parseEther(FUND.each) }),
+      Tb.mint(this.W.depositor.address, U(100000)),
+      Tb.mint(this.W.borrower.address, U(20000)),
+      Tb.mint(B.address, U(100000)),
+      Tb.approve(brokerAddr, ethers.MaxUint256),
+    ];
     if (harnessEnabled) {
-      onStatus("하네스 활성화…");
-      await (await (K as any).initHarness(
+      batch.push((K as any).connect(BN).initHarness(
         true, HARNESS.alpha, HARNESS.alphaBorrower, HARNESS.debtFloor, HARNESS.lockDuration, HARNESS.lambda
-      )).wait();
-      this.log("✓ 하네스 활성화 (①집중도 ②타임락 ③이력연동)");
+      ));
     }
-    onStatus("예금자·차입자 지갑 가스 충전…");
-    await (await B.sendTransaction({ to: this.W.depositor.address, value: ethers.parseEther(FUND.each) })).wait();
-    await (await B.sendTransaction({ to: this.W.borrower.address, value: ethers.parseEther(FUND.each) })).wait();
-    onStatus("dUSD 지급…");
-    await (await (T as any).mint(this.W.depositor.address, U(100000))).wait();
-    await (await (T as any).mint(this.W.borrower.address, U(20000))).wait();
-    await (await (T as any).mint(this.W.broker.address, U(100000))).wait();
+    await Promise.all((await Promise.all(batch)).map((t: any) => t.wait()));
+    if (harnessEnabled) this.log("✓ 하네스 활성화 (①집중도 ②타임락 ③이력연동)");
+
+    // The role wallets could not pay for gas until the sends above were mined; their approvals
+    // come from different accounts, so they need no nonce coordination.
     onStatus("승인 처리…");
-    await (await (T as any).connect(this.W.depositor).approve(await V.getAddress(), ethers.MaxUint256)).wait();
-    await (await (T as any).connect(this.W.broker).approve(await K.getAddress(), ethers.MaxUint256)).wait();
-    await (await (T as any).connect(this.W.borrower).approve(await K.getAddress(), ethers.MaxUint256)).wait();
-    const a = { token: await T.getAddress(), vault: await V.getAddress(), broker: await K.getAddress() };
+    await Promise.all((await Promise.all([
+      (T as any).connect(this.W.depositor).approve(vaultAddr, ethers.MaxUint256),
+      (T as any).connect(this.W.borrower).approve(brokerAddr, ethers.MaxUint256),
+    ])).map((t: any) => t.wait()));
+
+    const a = { token: tokenAddr, vault: vaultAddr, broker: brokerAddr };
     localStorage.setItem(this.dkey(), JSON.stringify(a));
     this.attach(a);
     this.log("배포 완료");
