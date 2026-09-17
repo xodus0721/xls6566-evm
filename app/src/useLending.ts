@@ -1,10 +1,51 @@
-import { useCallback, useRef, useState } from "react";
-import { LendingClient, explainError, type Snapshot } from "./lib/lending";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  LendingClient, MGMT_FEE_RATE, N, checkOriginations, explainError, harnessDebtFloor, harnessLoanCap,
+  quoteNewDebt, type LoanPlan, type Snapshot,
+} from "./lib/lending";
 import { DEFAULT_PARAMS, type FlowEvent, type LogLine, type Params, type ResultBox, type Step } from "./types";
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 const r0 = (v: number) => Math.round(v).toLocaleString();
+
+type Scen = "A" | "B" | "C" | "D";
+
+const MONTH = 2592000; // scenario A's payment interval
+/** Scenario D's own amounts. They are fixed rather than derived from the form, so the harness
+ *  D_floor chosen at deploy time has to leave room for both of its loans. */
+const D_CFG = { deposit: 50000, cover: 30000, each: 10000, loans: 2, payments: 2, interval: 40, grace: 20 };
+
+/** XLS rates are 1/10th bps: 12% → 12000. */
+const tenthBps = (pct: number) => Math.round(clamp(pct, 0, 100) * 1000);
+
+const planA = (p: Params): LoanPlan => ({ principal: p.principal, interestRaw: tenthBps(p.interestPct), interval: MONTH, payments: p.payments });
+const planB = (p: Params): LoanPlan => ({ ...planA(p), interval: p.interval });
+// Scenarios C and D use zero-interest loans so newDebt == principal (the point is concentration
+// and default history, not interest).
+const planC = (p: Params, principal: number): LoanPlan => ({ principal, interestRaw: 0, interval: 40, payments: p.payments });
+const planD = (): LoanPlan => ({ principal: D_CFG.each, interestRaw: 0, interval: D_CFG.interval, payments: D_CFG.payments });
+
+/** The D_floor a deployment made right now would carry (see {@link harnessDebtFloor}). */
+const floorFor = (p: Params) => harnessDebtFloor(quoteNewDebt(planA(p), MGMT_FEE_RATE), D_CFG.each * D_CFG.loans);
+
+/** Would a fresh deployment change the answer? Only when this one carries state no scenario can
+ *  undo: debt still outstanding, a recorded default (③ keeps CRM_eff raised for good), or a
+ *  D_floor pinned to different params — initHarness is write-once. On a clean book the gate is
+ *  about the parameters on screen, and redeploying would just burn gas to fail the same way. */
+export function redeployWouldHelp(s: Snapshot, p: Params): boolean {
+  if (s.debt > 0 || s.borrowerDebt > 0 || s.defaultRatePct > 0) return true;
+  return s.harnessOn && Math.abs(s.debtFloorAmt - N(floorFor(p))) > 1;
+}
+
+/** The oversized loan scenario C attempts. It has to exceed the harness ① cap to demonstrate
+ *  anything, and that cap follows the *deployed* D_floor — not the principal in the form, which
+ *  may have been changed since. */
+function bigLoanPrincipal(s: Snapshot | null, p: Params): number {
+  const naive = Math.round(p.principal * 1.5);
+  const cap = s ? harnessLoanCap(s) : Infinity;
+  return Number.isFinite(cap) ? Math.max(naive, Math.ceil(cap * 1.05) + 1) : naive;
+}
 
 export function useLending() {
   const [phase, setPhase] = useState<"connect" | "ready">("connect");
@@ -14,7 +55,7 @@ export function useLending() {
   const [setupStatus, setSetupStatus] = useState("");
   const [params, setParams] = useState<Params>(DEFAULT_PARAMS);
   const [snap, setSnap] = useState<Snapshot | null>(null);
-  const [scenario, setScenario] = useState<"A" | "B" | "C" | "D" | null>(null);
+  const [scenario, setScenario] = useState<Scen | null>(null);
   const [scenarioSub, setScenarioSub] = useState("");
   const [steps, setSteps] = useState<Step[]>([]);
   const [stepIndex, setStepIndex] = useState(0);
@@ -36,8 +77,8 @@ export function useLending() {
 
   // `textTo` is the same transfer seen from the receiving side: money leaving the depositor
   // (－50,000) is money arriving at the Vault (＋50,000). The packet flips label mid-flight.
-  const doFlow = useCallback(async (from: FlowEvent["from"], to: FlowEvent["to"], text: string, cls: FlowEvent["cls"] = "", textTo?: string) => {
-    setFlow({ from, to, text, cls, textTo, key: Date.now() + Math.random() });
+  const doFlow = useCallback(async (from: FlowEvent["from"], to: FlowEvent["to"], text: string, cls: FlowEvent["cls"] = "", textTo?: string, clsTo?: FlowEvent["cls"]) => {
+    setFlow({ from, to, text, cls, textTo, clsTo, key: Date.now() + Math.random() });
     await wait(1350);
   }, []);
 
@@ -56,10 +97,16 @@ export function useLending() {
   const [harnessToggle, setHarnessToggle] = useState(false);
   const setup = useCallback(async () => {
     setSetupBusy(true);
-    try { await client().setup(setSetupStatus, harnessToggle); setDeployed(true); setSetupStatus(""); await refresh(); }
+    try {
+      // initHarness is write-once, so D_floor is pinned here to the params on screen; it also
+      // has to keep scenario D's two loans against one borrower admissible.
+      const floor = harnessDebtFloor(quoteNewDebt(planA(params), MGMT_FEE_RATE), D_CFG.each * D_CFG.loans);
+      await client().setup(setSetupStatus, harnessToggle, floor);
+      setDeployed(true); setSetupStatus(""); await refresh();
+    }
     catch (e: any) { logRef.current(`✗ ${explainError(e)}`); }
     finally { setSetupBusy(false); }
-  }, [refresh, harnessToggle]);
+  }, [refresh, harnessToggle, params]);
 
   const [sweeping, setSweeping] = useState(false);
   const [sweepMsg, setSweepMsg] = useState("");
@@ -77,39 +124,102 @@ export function useLending() {
   const resetParams = useCallback(() => setParams(DEFAULT_PARAMS), []);
   const setParam = useCallback((k: keyof Params, v: number) => setParams((p) => ({ ...p, [k]: v })), []);
 
-  async function countdown(sec: number, label: string) {
-    for (let s = sec; s > 0; s--) { setCountdownMsg(`${label} ${s}초…`); await wait(1000); }
+  /** Count down to a chain-clock deadline. The last few seconds are re-read from the chain, so
+   *  the transaction only goes out once the node's own latest block agrees the gate has passed
+   *  — a browser-side sleep can run out while the block eth_estimateGas sees is still behind. */
+  async function countdownUntil(remaining: () => Promise<number>, label: string) {
+    let s = await remaining();
+    while (s > 0) {
+      setCountdownMsg(`${label} ${s}초…`);
+      await wait(1000);
+      s = s > 3 ? s - 1 : await remaining();
+    }
     setCountdownMsg("");
   }
 
-  function checkCover(p: Params): boolean {
-    const req = p.principal * (p.covMinPct / 100);
-    if (p.cover < req) {
-      setResult({ tone: "bad", title: "cover 부족", body: `CoverRateMinimum ${p.covMinPct}%에서는 cover ≥ ${r0(req)} 필요 (현재 ${p.cover.toLocaleString()}). cover를 올리거나 CoverRateMinimum을 낮추세요.` });
-      return false;
+  /** Report a scenario that stopped early. Logging alone leaves an empty result panel, which
+   *  is indistinguishable from the demo hanging. */
+  const fail = useCallback((e: any) => {
+    const msg = explainError(e);
+    logRef.current(`✗ ${msg}`);
+    setResult({ tone: "bad", title: "시나리오 중단", body: msg });
+  }, []);
+
+  /** Re-running a scenario after a redeploy means calling its runner again. They are declared
+   *  below, so route through a ref: a callback that captured itself would be read while it is
+   *  still being initialised. */
+  const runnersRef = useRef<Partial<Record<Scen, () => void>>>({});
+
+  /** Redeploy in place and resume the scenario that could not start. Keeps the role wallets
+   *  (they hold gas already funded from MetaMask) and the deployment's harness setting, so the
+   *  scenario the user was trying to see keeps its meaning. */
+  const redeployAndRun = useCallback(async (harnessOn: boolean, scen?: Scen) => {
+    setResult(null); setSetupBusy(true); setHarnessToggle(harnessOn);
+    let ok = false;
+    try {
+      client().resetDeployment();
+      setDeployed(false);
+      await client().setup(setSetupStatus, harnessOn, floorFor(params));
+      setDeployed(true); setSetupStatus(""); await refresh();
+      ok = true;
+    } catch (e: any) { fail(e); }
+    finally { setSetupBusy(false); }
+    if (ok && scen) runnersRef.current[scen]?.();
+  }, [params, refresh, fail]);
+
+  /** Replay the gates originate() applies — before the scenario spends any gas — and explain a
+   *  failure instead of reverting mid-run. Both gates are measured against a loan's *debt*
+   *  (principal + net interest) and the book's existing debt, not against the principal in the
+   *  form, so a check written in terms of the principal quietly disagrees with the contract.
+   *  @param crmSetPct the CoverRateMinimum in force at origination, or null to use the chain's.
+   *  @returns the snapshot it read, or null if the scenario must not start. */
+  const precheck = useCallback(async (cover: number, crmSetPct: number | null, loans: LoanPlan[], scen?: Scen): Promise<Snapshot | null> => {
+    let s: Snapshot;
+    try { s = await client().readState(); } catch (e: any) { fail(e); return null; }
+    setSnap(s);
+    const issue = checkOriginations(s, cover, crmSetPct ?? s.crmSetPct, loans);
+    if (!issue) return s;
+    const action = redeployWouldHelp(s, params)
+      ? { label: "재배포하고 실행", run: () => { void redeployAndRun(s.harnessOn, scen); } }
+      : undefined;
+    if (issue.kind === "cover") {
+      setResult({ tone: "bad", title: "cover 부족",
+        action, body: `신규 부채 ${r0(issue.debt)} (원금 ${issue.loan.principal.toLocaleString()} + 순이자)를 실행하려면 (기존 부채 + 신규 부채) × 유효 CoverRateMinimum = ${r0(issue.need)} 이상의 cover가 필요합니다 (현재 ${r0(issue.have)}).`,
+        note: `cover를 올리거나 CoverRateMinimum을 낮추세요. 요구치는 원금이 아니라 부채 기준이라 이자만큼 큽니다.` });
+    } else if (issue.limit === "borrower") {
+      setResult({ tone: "bad", title: "하네스 ① 차입자 집중도 한도 초과",
+        action, body: `이 차입자에게 이미 ${r0(issue.existing)}의 미상환 부채가 있어, 신규 ${r0(issue.debt)}을 더한 ${r0(issue.need)}이 차입자 한도 ${r0(issue.have)}을 넘습니다 (borrowerCap = α_borrower × max(총부채, D_floor)).`,
+        note: `이전 시나리오의 대출이 아직 상환되지 않았습니다. 「forget」 후 다시 배포하면 초기화됩니다.` });
+    } else {
+      setResult({ tone: "bad", title: "하네스 ① 단일대출 집중도 한도 초과",
+        action, body: `이 대출의 부채 ${r0(issue.debt)} (원금 ${issue.loan.principal.toLocaleString()} + 순이자)가 단일대출 한도 ${r0(issue.have)}을 넘습니다 (loanCap = α × max(총부채, D_floor)). 원금을 낮추면 실행됩니다.`,
+        note: `하네스 설정(D_floor 포함)은 배포 시 1회만 기록됩니다(initHarness는 write-once). 지금 파라미터에 맞춘 한도로 바꾸려면 「forget」 후 다시 배포하세요.` });
     }
-    return true;
-  }
+    return null;
+  }, [fail, params, redeployAndRun]);
 
   const raw = {
-    interest: (p: Params) => Math.round(clamp(p.interestPct, 0, 100) * 1000),
-    covMin: (p: Params) => Math.round(clamp(p.covMinPct, 0, 100) * 1000),
-    covLiq: (p: Params) => Math.round(clamp(p.covLiqPct, 0, 100) * 1000),
+    interest: (p: Params) => tenthBps(p.interestPct),
+    covMin: (p: Params) => tenthBps(p.covMinPct),
+    covLiq: (p: Params) => tenthBps(p.covLiqPct),
   };
 
   const runA = useCallback(async () => {
     const p = params, c = client();
-    setResult(null);
-    if (!checkCover(p)) { setScenario("A"); return; }
-    setRunning(true); setDefaulted(false); setScenario("A");
+    setResult(null); setScenario("A");
+    const loan = planA(p);
+    // The header, steps and progress belong to the scenario just picked — set them before the
+    // precheck, or a scenario that cannot start leaves the previous one's title on screen.
     setScenarioSub("정상 렌딩 — 예금자가 이자를 법니다");
-    setSteps(SCEN_A(p)); await refresh();
+    setSteps(SCEN_A(p)); setStep(0);
+    setRunning(true); setDefaulted(false);
+    if (!(await precheck(p.cover, p.covMinPct, [loan], "A"))) { setRunning(false); return; }
     try {
       await c.setCoverRates(raw.covMin(p), raw.covLiq(p));
       const dep0 = (await c.readState()).balDep;
       setStep(0); await doFlow("dep", "vault", `－${p.deposit.toLocaleString()}`, "", `＋${p.deposit.toLocaleString()}`); await c.deposit(p.deposit); await refresh();
       setStep(1); await doFlow("broker", "vault", `cover ${p.cover.toLocaleString()}`); await c.cover(p.cover); await refresh();
-      setStep(2); await doFlow("vault", "bor", `－${p.principal.toLocaleString()}`, "gain", `＋${p.principal.toLocaleString()}`); await c.originate(p.principal, 2592000, 30, p.payments, raw.interest(p)); await refresh();
+      setStep(2); await doFlow("vault", "bor", `실행 ${p.principal.toLocaleString()}`, "", `＋${p.principal.toLocaleString()}`, "gain"); await c.originate(loan.principal, loan.interval, 30, loan.payments, loan.interestRaw); await refresh();
       setStep(3);
       for (let i = 0; i < p.payments; i++) { await doFlow("bor", "vault", `상환 ${i + 1}/${p.payments}`); await c.pay(); await refresh(); }
       setStep(4); await doFlow("vault", "broker", `cover ${p.cover.toLocaleString()}`); await c.coverWithdraw(p.cover); await refresh();
@@ -118,96 +228,133 @@ export function useLending() {
       setResult({ tone: "ok", title: "완료 · 손실 0",
         body: `예금자 지갑 ${dep1.toLocaleString(undefined, { maximumFractionDigits: 2 })} dUSD (예치금 전액 회수 + 이자 ${profit >= 0 ? "+" : ""}${profit.toLocaleString(undefined, { maximumFractionDigits: 2 })}). 브로커는 cover를 온전히 회수했습니다.`,
         note: `한 지갑이 3역을 겸하지 않고 역할별 별도 계정이라, 예금자의 이자 수익이 잔액 증가로 그대로 보입니다.` });
-    } catch (e: any) { logRef.current(`✗ ${explainError(e)}`); }
+    } catch (e: any) { fail(e); }
     finally { setRunning(false); }
-  }, [params, refresh, doFlow, setStep]);
+  }, [params, refresh, doFlow, setStep, precheck, fail]);
 
   const runB = useCallback(async () => {
     const p = params, c = client();
-    setResult(null);
-    if (!checkCover(p)) { setScenario("B"); return; }
-    setRunning(true); setDefaulted(false); setScenario("B");
+    setResult(null); setScenario("B");
+    const loan = planB(p);
     setScenarioSub("채무불이행 — 예금자가 손실을 봅니다");
-    setSteps(SCEN_B(p)); await refresh();
+    setSteps(SCEN_B(p)); setStep(0);
+    setRunning(true); setDefaulted(false);
+    if (!(await precheck(p.cover, p.covMinPct, [loan], "B"))) { setRunning(false); return; }
     try {
       await c.setCoverRates(raw.covMin(p), raw.covLiq(p));
       setStep(0); await doFlow("dep", "vault", `－${p.deposit.toLocaleString()}`, "", `＋${p.deposit.toLocaleString()}`); await c.deposit(p.deposit); await refresh();
       setStep(1); await doFlow("broker", "vault", `cover ${p.cover.toLocaleString()}`); await c.cover(p.cover); await refresh();
-      setStep(2); await doFlow("vault", "bor", `－${p.principal.toLocaleString()}`, "gain", `＋${p.principal.toLocaleString()}`); await c.originate(p.principal, p.interval, p.grace, p.payments, raw.interest(p)); await refresh();
+      setStep(2); await doFlow("vault", "bor", `실행 ${p.principal.toLocaleString()}`, "", `＋${p.principal.toLocaleString()}`, "gain"); await c.originate(loan.principal, loan.interval, p.grace, loan.payments, loan.interestRaw); await refresh();
       const s0 = await c.readState(); const cov0 = s0.cover, tot0 = s0.vaultTotal;
-      setStep(3); await countdown(p.interval + 5, "연체까지"); await doFlow("bor", "vault", "미상환", "loss"); await c.impair(); await refresh();
-      setStep(4); await countdown(p.grace + 5, "default 가능까지"); setDefaulted(true);
+      setStep(3); await countdownUntil(() => c.secondsUntil("impair"), "연체까지"); await doFlow("bor", "vault", "미상환", "loss"); await c.impair(); await refresh();
+      setStep(4); await countdownUntil(() => c.secondsUntil("default"), "default 가능까지"); setDefaulted(true);
       await doFlow("broker", "vault", "cover 흡수", "gain"); await c.default_(); await refresh();
       const s1 = await c.readState();
       const covUsed = Math.max(0, cov0 - s1.cover), depLoss = Math.max(0, tot0 - s1.vaultTotal);
-      setStep(5); await doFlow("vault", "dep", "인출", "loss", "＋인출"); await c.withdraw(); await refresh();
+      setStep(5); await doFlow("vault", "dep", "인출", "loss", "인출 (예치금 미만)"); await c.withdraw(); await refresh();
       const zeroLoss = depLoss < 1;
       setResult({ tone: zeroLoss ? "ok" : "bad",
         title: zeroLoss ? "cover가 손실 전액 흡수 · 예금자 손실 0" : "손실 발생 · 차입자 채무불이행",
         body: `차입자 지갑에는 빌린 ${p.principal.toLocaleString()}이 미상환 상태로 남아 있습니다. 대출 원금 ${p.principal.toLocaleString()}은 cover가 ${r0(covUsed)} 흡수, 예금자가 ${r0(depLoss)} 부담. ${r0(covUsed)} + ${r0(depLoss)} = ${p.principal.toLocaleString()} — first-loss waterfall이 손실을 정확히 배분합니다.`,
         note: `CoverRateMinimum ${p.covMinPct}% · CoverRateLiquidation ${p.covLiqPct}% 적용. 비율을 올리면 cover가 더 많이 흡수합니다.` });
-    } catch (e: any) { logRef.current(`✗ ${explainError(e)}`); }
+    } catch (e: any) { fail(e); }
     finally { setRunning(false); }
-  }, [params, refresh, doFlow, setStep]);
+  }, [params, refresh, doFlow, setStep, precheck, fail]);
 
   // Scenario C — harness ① concentration limit demo
   const runC = useCallback(async () => {
     const p = params, c = client();
-    setResult(null);
-    if (!checkCover(p)) { setScenario("C"); return; }
-    setRunning(true); setDefaulted(false); setScenario("C");
+    setResult(null); setScenario("C");
+    // Only the fallback loan has to be admissible; the oversized one is meant to be refused.
+    const loan = planC(p, p.principal);
     setScenarioSub("집중도 한도 — 하네스 ①");
-    setSteps(SCEN_C(p)); await refresh();
+    setSteps(SCEN_C(p, bigLoanPrincipal(snap, p))); setStep(0);
+    setRunning(true); setDefaulted(false);
+    const s0 = await precheck(p.cover, null, [loan], "C");
+    if (!s0) { setRunning(false); return; }
+    // now that a fresh snapshot is in hand, restate the attempt with the exact cap
+    const big = bigLoanPrincipal(s0, p);
+    setSteps(SCEN_C(p, big));
     try {
-      const big = Math.round(p.principal * 1.5);
       setStep(0); await doFlow("dep", "vault", `－${p.deposit.toLocaleString()}`, "", `＋${p.deposit.toLocaleString()}`); await c.deposit(p.deposit); await refresh();
       setStep(1); await doFlow("broker", "vault", `cover ${p.cover.toLocaleString()}`); await c.cover(p.cover); await refresh();
       setStep(2);
       // Zero-interest loans so newDebt == principal (concentration demo; interest irrelevant).
-      const res = await c.tryOriginate(big, 40, 20, p.payments, 0);
+      const res = await c.tryOriginate(big, loan.interval, 20, loan.payments, 0);
       const s = await c.readState();
+      // ① is the only thing that raises these. Any other revert is a different problem, and
+      // reporting it as the harness at work would contradict this card's own ON/OFF badge.
+      const blockedByHarness = /^(Borrower)?ConcentrationExceeded\(/.test(res.error ?? "");
       if (res.ok) {
-        await doFlow("vault", "bor", `－${big.toLocaleString()}`, "gain", `＋${big.toLocaleString()}`); await refresh();
+        await doFlow("vault", "bor", `실행 ${big.toLocaleString()}`, "", `＋${big.toLocaleString()}`, "gain"); await refresh();
         setStep(3);
-        setResult({ tone: "bad", title: "하네스 없음 · 집중 리스크 노출",
-          body: `단일 대출 ${big.toLocaleString()}이 그대로 실행됐습니다 — 한 대출이 풀 전체를 지배할 수 있습니다(Orthogonal 80% 유형).`,
-          note: `하네스를 켜고 배포하면 이 대출은 집중도 한도(α)로 차단됩니다.` });
+        setResult(s.harnessOn
+          ? { tone: "bad", title: "하네스 ON · 한도가 이 대출보다 큽니다",
+              body: `단일 대출 ${big.toLocaleString()}이 집중도 한도 ${r0(harnessLoanCap(s0))} 이내라 그대로 실행됐습니다.`,
+              note: `D_floor는 배포 시점 파라미터로 고정됩니다(write-once). 원금을 키우거나 「forget」 후 재배포하면 ①이 차단하는 것을 볼 수 있습니다.` }
+          : { tone: "bad", title: "하네스 없음 · 집중 리스크 노출",
+              body: `단일 대출 ${big.toLocaleString()}이 그대로 실행됐습니다 — 한 대출이 풀 전체를 지배할 수 있습니다(Orthogonal 80% 유형).`,
+              note: `하네스를 켜고 배포하면 이 대출은 집중도 한도(α)로 차단됩니다.` });
+      } else if (!blockedByHarness) {
+        setStep(3);
+        setResult({ tone: "bad", title: "대형 대출이 집중도 한도와 무관한 이유로 실패",
+          body: res.error ?? "알 수 없는 오류",
+          note: `현재 하네스 ${s.harnessOn ? "ON" : "OFF"} — 이 실패는 §4.2 ①이 아닙니다.` });
       } else {
-        setStep(3); await doFlow("vault", "bor", `－${p.principal.toLocaleString()}`, "gain", `＋${p.principal.toLocaleString()}`);
-        await c.originate(p.principal, 40, 20, p.payments, 0); await refresh();
+        setStep(3); await doFlow("vault", "bor", `실행 ${p.principal.toLocaleString()}`, "", `＋${p.principal.toLocaleString()}`, "gain");
+        await c.originate(loan.principal, loan.interval, 20, loan.payments, loan.interestRaw); await refresh();
         setResult({ tone: "ok", title: "하네스 ①이 대형 단일대출 차단",
           body: `${big.toLocaleString()} 단일대출은 집중도 한도(부채 대비 α)를 넘어 거부됐고, 한도 내 ${p.principal.toLocaleString()} 대출만 실행됐습니다.`,
-          note: `유효 CRM ${s.effCrmPct.toFixed(0)}% · 디폴트율 ${s.defaultRatePct.toFixed(0)}%. 디폴트가 쌓이면 ③에 의해 요구 cover가 자동 상향됩니다.` });
+          note: `거부 사유 ${res.error} · 유효 CRM ${s.effCrmPct.toFixed(0)}% · 디폴트율 ${s.defaultRatePct.toFixed(0)}%. 디폴트가 쌓이면 ③에 의해 요구 cover가 자동 상향됩니다.` });
       }
-    } catch (e: any) { logRef.current(`✗ ${explainError(e)}`); }
+    } catch (e: any) { fail(e); }
     finally { setRunning(false); }
-  }, [params, refresh, doFlow, setStep]);
+  }, [params, snap, refresh, doFlow, setStep, precheck, fail]);
 
   // Scenario D — harness ③ history-linked cover rate
   const runD = useCallback(async () => {
     const c = client();
-    setResult(null); setRunning(true); setDefaulted(false); setScenario("D");
+    setResult(null); setScenario("D");
+    const loans = Array.from({ length: D_CFG.loans }, planD);
     setScenarioSub("이력 연동 공탁 비율 — 하네스 ③");
-    setSteps(SCEN_D()); await refresh();
+    setSteps(SCEN_D()); setStep(0);
+    setRunning(true); setDefaulted(false);
+    if (!(await precheck(D_CFG.cover, null, loans, "D"))) { setRunning(false); return; }
     try {
-      setStep(0); await doFlow("dep", "vault", "－50,000", "", "＋50,000"); await c.deposit(50000); await refresh();
-      setStep(1); await doFlow("broker", "vault", "cover 30,000"); await c.cover(30000); await refresh();
+      const each = D_CFG.each.toLocaleString();
+      const lend = async (l: typeof loans[number]) => {
+        await doFlow("vault", "bor", `실행 ${each}`, "", `＋${each}`, "gain");
+        await c.originate(l.principal, l.interval, D_CFG.grace, l.payments, l.interestRaw);
+        await refresh();
+      };
+      setStep(0); await doFlow("dep", "vault", `－${D_CFG.deposit.toLocaleString()}`, "", `＋${D_CFG.deposit.toLocaleString()}`); await c.deposit(D_CFG.deposit); await refresh();
+      setStep(1); await doFlow("broker", "vault", `cover ${D_CFG.cover.toLocaleString()}`); await c.cover(D_CFG.cover); await refresh();
       setStep(2);
-      await doFlow("vault", "bor", "－10,000", "gain", "＋10,000"); await c.originate(10000, 40, 20, 2, 0); await refresh();
+      await lend(loans[0]);
       const before = (await c.readState()).effCrmPct;
-      await doFlow("vault", "bor", "－10,000", "gain", "＋10,000"); await c.originate(10000, 40, 20, 2, 0); await refresh();
+      for (const l of loans.slice(1)) await lend(l);
       setStep(3);
-      await countdown(70, "default 가능까지"); setDefaulted(true);
+      await countdownUntil(() => c.secondsUntil("default"), "default 가능까지"); setDefaulted(true);
       await doFlow("bor", "vault", "default", "loss"); await c.default_(); await refresh();
       const s = await c.readState();
       setResult({ tone: "ok", title: "이력 연동으로 요구 cover 자동 상향 (③)",
-        body: `대출 2건 중 1건 디폴트 → 디폴트율 ${s.defaultRatePct.toFixed(0)}%. 유효 CoverRateMinimum이 ${before.toFixed(0)}% → ${s.effCrmPct.toFixed(0)}%로 자동 상향됐습니다.`,
+        body: `대출 ${D_CFG.loans}건 중 1건 디폴트 → 디폴트율 ${s.defaultRatePct.toFixed(0)}%. 유효 CoverRateMinimum이 ${before.toFixed(0)}% → ${s.effCrmPct.toFixed(0)}%로 자동 상향됐습니다.`,
         note: `CRM_eff = max(CRM_set, CRM_floor + λ×디폴트율). 심사를 소홀히 해 디폴트가 쌓인 기관일수록 다음 대출에 더 많은 cover를 요구받습니다 — 예금자 투표 없이 온체인 이력만으로 결정론적으로.` });
-    } catch (e: any) { logRef.current(`✗ ${explainError(e)}`); }
+    } catch (e: any) { fail(e); }
     finally { setRunning(false); }
-  }, [refresh, doFlow, setStep]);
+  }, [refresh, doFlow, setStep, precheck, fail]);
 
-  const backToPicker = useCallback(() => { setScenario(null); setResult(null); }, []);
+  useEffect(() => {
+    runnersRef.current = { A: () => void runA(), B: () => void runB(), C: () => void runC(), D: () => void runD() };
+  }, [runA, runB, runC, runD]);
+
+  /** Leaving the runner drops everything that belongs to the finished run — header, steps,
+   *  progress, result and the transaction log — so picking a scenario again starts from a
+   *  clean screen instead of reading as a continuation of the last one. */
+  const backToPicker = useCallback(() => {
+    setScenario(null); setResult(null); setScenarioSub("");
+    setSteps([]); setStep(0); setDefaulted(false); setFlow(null); setLog([]);
+  }, [setStep]);
 
   return {
     phase, account, deployed, setupBusy, setupStatus,
@@ -215,6 +362,7 @@ export function useLending() {
     harnessToggle, setHarnessToggle,
     snap, scenario, scenarioSub, steps, stepIndex, running, flow, defaulted, result, log, countdownMsg,
     connect, setup, forget, runA, runB, runC, runD, backToPicker,
+    bigLoan: bigLoanPrincipal(snap, params),
     sweep, sweeping, sweepMsg,
     addrs: () => client().addrs(),
   };
@@ -241,8 +389,7 @@ function SCEN_B(p: Params): Step[] {
     { title: "예금자가 남은 금액만 인출 (손실 확정)", desc: "예금자는 줄어든 Vault 가치만큼만 돌려받습니다. 차입자 지갑에는 빌린 돈이 그대로 남아 있습니다(미상환)." },
   ];
 }
-function SCEN_C(p: Params): Step[] {
-  const big = Math.round(p.principal * 1.5);
+function SCEN_C(p: Params, big: number): Step[] {
   return [
     { title: `예금자가 Vault에 ${p.deposit.toLocaleString()} 예치`, desc: "대출 재원을 공급합니다." },
     { title: `브로커가 cover ${p.cover.toLocaleString()} 적립`, desc: "완충자본을 넣습니다." },
@@ -252,9 +399,9 @@ function SCEN_C(p: Params): Step[] {
 }
 function SCEN_D(): Step[] {
   return [
-    { title: "예금자가 Vault에 50,000 예치", desc: "대출 재원을 공급합니다." },
-    { title: "브로커가 cover 30,000 적립", desc: "요구 비율이 올라가도 견딜 수 있도록 완충자본을 넉넉히 넣습니다." },
-    { title: "같은 기관이 대출 2건 실행 (각 10,000)", desc: "실행 원금 누계 20,000. 아직 디폴트가 없어 요구 CoverRateMinimum은 설정값(10%) 그대로입니다." },
-    { title: "1건 디폴트 → 요구 cover 비율(③) 자동 상향", desc: "디폴트율 = 디폴트/실행원금 = 50%. CRM_eff = max(설정 10%, 하한 10% + λ×50%) = 60%. 심사를 소홀히 한 기관일수록 다음 대출에 더 많은 cover를 요구받습니다." },
+    { title: `예금자가 Vault에 ${D_CFG.deposit.toLocaleString()} 예치`, desc: "대출 재원을 공급합니다." },
+    { title: `브로커가 cover ${D_CFG.cover.toLocaleString()} 적립`, desc: "요구 비율이 올라가도 견딜 수 있도록 완충자본을 넉넉히 넣습니다." },
+    { title: `같은 기관이 대출 ${D_CFG.loans}건 실행 (각 ${D_CFG.each.toLocaleString()})`, desc: `실행 원금 누계 ${(D_CFG.each * D_CFG.loans).toLocaleString()}. 아직 디폴트가 없어 요구 CoverRateMinimum은 설정값 그대로입니다.` },
+    { title: "1건 디폴트 → 요구 cover 비율(③) 자동 상향", desc: `디폴트율 = 디폴트/실행원금 = ${Math.round(100 / D_CFG.loans)}%. CRM_eff = max(CRM_set, CRM_floor + λ×디폴트율). 심사를 소홀히 한 기관일수록 다음 대출에 더 많은 cover를 요구받습니다.` },
   ];
 }

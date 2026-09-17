@@ -1,8 +1,31 @@
 import { useLending } from "./useLending";
 import { FlowDiagram } from "./components/FlowDiagram";
+import type { Snapshot } from "./lib/lending";
 import type { Params } from "./types";
 
 const f2 = (v: number) => v.toLocaleString(undefined, { maximumFractionDigits: 2 });
+
+/** Vault/broker figures, in as few rows as divide evenly: eight tiles read better as 4 × 2
+ *  than as a row of seven and an orphan. */
+export function StatGrid({ snap }: { snap: Snapshot }) {
+  const tiles: [string, string][] = [
+    ["Vault 총자산", f2(snap.vaultTotal)], ["대출중", f2(snap.onLoan)], ["미실현 손실", f2(snap.loss)],
+    ["Broker cover", f2(snap.cover)], ["예금자 인출가능", f2(snap.maxWithdraw)],
+    ...(snap.harnessOn ? [
+      ["유효 CRM (③)", `${snap.effCrmPct.toFixed(0)}%`],
+      ["디폴트율", `${snap.defaultRatePct.toFixed(0)}%`],
+      ["cover 회수가능 (②)", f2(snap.coverWithdrawable)],
+    ] as [string, string][] : []),
+  ];
+  const cols = tiles.length > 5 ? Math.ceil(tiles.length / 2) : tiles.length;
+  return (
+    <div className="grid" style={{ "--cols": cols } as React.CSSProperties}>
+      {tiles.map(([k, v]) => (
+        <div className="stat" key={k}><div className="k">{k}</div><div className="v">{v}</div></div>
+      ))}
+    </div>
+  );
+}
 
 const PARAM_FIELDS: Array<{ k: keyof Params; label: string; hint: string }> = [
   { k: "deposit", label: "예치 (dUSD)", hint: "예금자가 Vault에" },
@@ -101,7 +124,8 @@ export default function App() {
           </div>
           <p className="hint">
             💡 default 시 cover 흡수액 = <code>부채 × CoverRateMinimum × CoverRateLiquidation</code> (상한).
-            CoverRateMinimum을 올리면 cover가 손실을 더 많이 흡수합니다 — 단 대출 실행에는 <code>cover ≥ 원금 × CoverRateMinimum</code>이 필요합니다.
+            CoverRateMinimum을 올리면 cover가 손실을 더 많이 흡수합니다 — 단 대출 실행에는
+            <code>cover ≥ (기존 부채 + 신규 부채) × CoverRateMinimum</code>이 필요합니다. 신규 부채는 원금이 아니라 <b>원금 + 순이자</b>라, 요구 cover는 원금 기준보다 이자만큼 큽니다.
           </p>
         </div>
       )}
@@ -139,7 +163,7 @@ export default function App() {
             </div>
             <p className="mut" style={{ margin: 0 }}>부채 대비 α를 넘는 <b>대형 단일대출</b>을 시도합니다. 하네스가 켜져 있으면 §4.2 ①이 <b>LoanSet 앞단에서 차단</b>합니다.</p>
             <div className="params">
-              <div className="r"><span className="mut">대형대출 시도</span><b>{Math.round(L.params.principal * 1.5).toLocaleString()}</b></div>
+              <div className="r"><span className="mut">대형대출 시도</span><b>{L.bigLoan.toLocaleString()}</b></div>
               <div className="r"><span className="mut">유효 CRM</span><b>{L.snap ? L.snap.effCrmPct.toFixed(0) : "—"}%</b></div>
               <div className="r"><span className="mut">디폴트율</span><b>{L.snap ? L.snap.defaultRatePct.toFixed(0) : "—"}%</b></div>
             </div>
@@ -189,25 +213,18 @@ export default function App() {
             큰 숫자는 <b>지갑 총잔액</b>이고, 예치·대출·상환은 그 일부가 오가는 것입니다.
           </p>
 
-          <div className="grid">
-            {L.snap && ([
-              ["Vault 총자산", f2(L.snap.vaultTotal)], ["대출중", f2(L.snap.onLoan)], ["미실현 손실", f2(L.snap.loss)],
-              ["Broker cover", f2(L.snap.cover)], ["예금자 인출가능", f2(L.snap.maxWithdraw)],
-              ...(L.snap.harnessOn ? [
-                ["유효 CRM (③)", `${L.snap.effCrmPct.toFixed(0)}%`],
-                ["디폴트율", `${L.snap.defaultRatePct.toFixed(0)}%`],
-                ["cover 회수가능 (②)", f2(L.snap.coverWithdrawable)],
-              ] : []),
-            ] as [string, string][]).map(([k, v]) => (
-              <div className="stat" key={k}><div className="k">{k}</div><div className="v">{v}</div></div>
-            ))}
-          </div>
+          {L.snap && <StatGrid snap={L.snap} />}
 
           {L.result && (
             <div className={"result " + L.result.tone}>
               <div className="rt">{L.result.title}</div>
               <div>{L.result.body}</div>
               {L.result.note && <div className="rn">{L.result.note}</div>}
+              {L.result.action && (
+                <button style={{ marginTop: 10 }} onClick={L.result.action.run} disabled={L.running || L.setupBusy}>
+                  {L.setupBusy ? (L.setupStatus || "재배포 중…") : L.result.action.label}
+                </button>
+              )}
             </div>
           )}
 

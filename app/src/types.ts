@@ -16,10 +16,19 @@ export interface FlowEvent {
    *  receiving side (−50,000 leaving the depositor is +50,000 arriving at the Vault).
    *  Omitted for flows that carry no sign. */
   textTo?: string;
+  /** Colour for the receiving half of the flight. A transfer can be neutral on the way out
+   *  and a gain on arrival (the Vault disbursing a loan), so the colour has to be able to
+   *  flip with `textTo`; without it half of every packet's life shows a sign and a colour
+   *  that disagree. Defaults to `cls`. */
+  clsTo?: FlowEvent["cls"];
 }
 
 export interface Step { title: string; desc: string; }
 
 export interface LogLine { text: string; hash?: string; key: number; }
 
-export interface ResultBox { tone: "ok" | "bad"; title: string; body: string; note?: string; }
+export interface ResultBox {
+  tone: "ok" | "bad"; title: string; body: string; note?: string;
+  /** Offered only when it would actually change the outcome — see `redeployWouldHelp`. */
+  action?: { label: string; run: () => void };
+}

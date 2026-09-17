@@ -46,8 +46,12 @@ export function FlowDiagram({ snap, flow, defaulted }: { snap: Snapshot | null; 
     refs[flow.to].current?.classList.add("hot");
     requestAnimationFrame(() => { p.style.opacity = "1"; p.style.left = b.x + "px"; p.style.top = b.y + "px"; });
     // Past the midpoint of the .95s travel the packet belongs to the receiver, so it flips to
-    // the receiving side's sign.
-    const t0 = flow.textTo ? setTimeout(() => { p.textContent = flow.textTo!; }, 520) : undefined;
+    // the receiving side's sign — and to that side's colour, which is not always the sender's.
+    const flips = flow.textTo !== undefined || flow.clsTo !== undefined;
+    const t0 = flips ? setTimeout(() => {
+      if (flow.textTo !== undefined) p.textContent = flow.textTo;
+      p.className = "packet " + ((flow.clsTo ?? flow.cls) || "");
+    }, 520) : undefined;
     const t1 = setTimeout(() => { p.style.opacity = "0"; }, 1050);
     const t2 = setTimeout(() => {
       p.remove();
