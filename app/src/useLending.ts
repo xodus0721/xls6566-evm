@@ -14,7 +14,7 @@ type Scen = "A" | "B" | "C" | "D";
 const MONTH = 2592000; // scenario A's payment interval
 /** Scenario D's own amounts. They are fixed rather than derived from the form, so the harness
  *  D_floor chosen at deploy time has to leave room for both of its loans. */
-const D_CFG = { deposit: 50000, cover: 30000, each: 10000, loans: 2, payments: 2, interval: 40, grace: 20 };
+export const D_CFG = { deposit: 50000, cover: 30000, each: 10000, loans: 2, payments: 2, interval: 40, grace: 20 };
 
 /** XLS rates are 1/10th bps: 12% → 12000. */
 const tenthBps = (pct: number) => Math.round(clamp(pct, 0, 100) * 1000);
@@ -53,7 +53,10 @@ export function useLending() {
   const [deployed, setDeployed] = useState(false);
   const [setupBusy, setSetupBusy] = useState(false);
   const [setupStatus, setSetupStatus] = useState("");
-  const [params, setParams] = useState<Params>(DEFAULT_PARAMS);
+  // Each scenario keeps its own parameters, so values tuned for one never leak into another.
+  const [paramsBy, setParamsBy] = useState<Record<Scen, Params>>({ A: DEFAULT_PARAMS, B: DEFAULT_PARAMS, C: DEFAULT_PARAMS, D: DEFAULT_PARAMS });
+  /** The scenario whose parameter screen is open; `scenario` is only set once it runs. */
+  const [selected, setSelected] = useState<Scen | null>(null);
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [scenario, setScenario] = useState<Scen | null>(null);
   const [scenarioSub, setScenarioSub] = useState("");
@@ -98,15 +101,15 @@ export function useLending() {
   const setup = useCallback(async () => {
     setSetupBusy(true);
     try {
-      // initHarness is write-once, so D_floor is pinned here to the params on screen; it also
+      // initHarness is write-once, so D_floor is pinned here to scenario A's params; it also
       // has to keep scenario D's two loans against one borrower admissible.
-      const floor = harnessDebtFloor(quoteNewDebt(planA(params), MGMT_FEE_RATE), D_CFG.each * D_CFG.loans);
+      const floor = harnessDebtFloor(quoteNewDebt(planA(paramsBy.A), MGMT_FEE_RATE), D_CFG.each * D_CFG.loans);
       await client().setup(setSetupStatus, harnessToggle, floor);
       setDeployed(true); setSetupStatus(""); await refresh();
     }
     catch (e: any) { logRef.current(`✗ ${explainError(e)}`); }
     finally { setSetupBusy(false); }
-  }, [refresh, harnessToggle, params]);
+  }, [refresh, harnessToggle, paramsBy]);
 
   const [sweeping, setSweeping] = useState(false);
   const [sweepMsg, setSweepMsg] = useState("");
@@ -121,8 +124,17 @@ export function useLending() {
   }, []);
 
   const forget = useCallback(() => { client().reset(); localStorage.clear(); location.reload(); }, []);
-  const resetParams = useCallback(() => setParams(DEFAULT_PARAMS), []);
-  const setParam = useCallback((k: keyof Params, v: number) => setParams((p) => ({ ...p, [k]: v })), []);
+  const resetParams = useCallback(() => {
+    if (selected) setParamsBy((b) => ({ ...b, [selected]: DEFAULT_PARAMS }));
+  }, [selected]);
+  const setParam = useCallback((k: keyof Params, v: number) => {
+    if (selected) setParamsBy((b) => ({ ...b, [selected]: { ...b[selected], [k]: v } }));
+  }, [selected]);
+  /** Open a scenario's parameter screen, starting from its defaults every time. */
+  const selectScenario = useCallback((scen: Scen) => {
+    setParamsBy((b) => ({ ...b, [scen]: DEFAULT_PARAMS }));
+    setSelected(scen);
+  }, []);
 
   /** Count down to a chain-clock deadline. The last few seconds are re-read from the chain, so
    *  the transaction only goes out once the node's own latest block agrees the gate has passed
@@ -159,13 +171,13 @@ export function useLending() {
     try {
       client().resetDeployment();
       setDeployed(false);
-      await client().setup(setSetupStatus, harnessOn, floorFor(params));
+      await client().setup(setSetupStatus, harnessOn, floorFor(paramsBy[scen ?? "A"]));
       setDeployed(true); setSetupStatus(""); await refresh();
       ok = true;
     } catch (e: any) { fail(e); }
     finally { setSetupBusy(false); }
     if (ok && scen) runnersRef.current[scen]?.();
-  }, [params, refresh, fail]);
+  }, [paramsBy, refresh, fail]);
 
   /** Replay the gates originate() applies — before the scenario spends any gas — and explain a
    *  failure instead of reverting mid-run. Both gates are measured against a loan's *debt*
@@ -179,7 +191,7 @@ export function useLending() {
     setSnap(s);
     const issue = checkOriginations(s, cover, crmSetPct ?? s.crmSetPct, loans);
     if (!issue) return s;
-    const action = redeployWouldHelp(s, params)
+    const action = redeployWouldHelp(s, paramsBy[scen ?? "A"])
       ? { label: "재배포하고 실행", run: () => { void redeployAndRun(s.harnessOn, scen); } }
       : undefined;
     if (issue.kind === "cover") {
@@ -196,7 +208,7 @@ export function useLending() {
         note: `하네스 설정(D_floor 포함)은 배포 시 1회만 기록됩니다(initHarness는 write-once). 지금 파라미터에 맞춘 한도로 바꾸려면 「forget」 후 다시 배포하세요.` });
     }
     return null;
-  }, [fail, params, redeployAndRun]);
+  }, [fail, paramsBy, redeployAndRun]);
 
   const raw = {
     interest: (p: Params) => tenthBps(p.interestPct),
@@ -205,7 +217,7 @@ export function useLending() {
   };
 
   const runA = useCallback(async () => {
-    const p = params, c = client();
+    const p = paramsBy.A, c = client();
     setResult(null); setScenario("A");
     const loan = planA(p);
     // The header, steps and progress belong to the scenario just picked — set them before the
@@ -230,10 +242,10 @@ export function useLending() {
         note: `한 지갑이 3역을 겸하지 않고 역할별 별도 계정이라, 예금자의 이자 수익이 잔액 증가로 그대로 보입니다.` });
     } catch (e: any) { fail(e); }
     finally { setRunning(false); }
-  }, [params, refresh, doFlow, setStep, precheck, fail]);
+  }, [paramsBy, refresh, doFlow, setStep, precheck, fail]);
 
   const runB = useCallback(async () => {
-    const p = params, c = client();
+    const p = paramsBy.B, c = client();
     setResult(null); setScenario("B");
     const loan = planB(p);
     setScenarioSub("채무불이행 — 예금자가 손실을 봅니다");
@@ -259,11 +271,11 @@ export function useLending() {
         note: `CoverRateMinimum ${p.covMinPct}% · CoverRateLiquidation ${p.covLiqPct}% 적용. 비율을 올리면 cover가 더 많이 흡수합니다.` });
     } catch (e: any) { fail(e); }
     finally { setRunning(false); }
-  }, [params, refresh, doFlow, setStep, precheck, fail]);
+  }, [paramsBy, refresh, doFlow, setStep, precheck, fail]);
 
   // Scenario C — harness ① concentration limit demo
   const runC = useCallback(async () => {
-    const p = params, c = client();
+    const p = paramsBy.C, c = client();
     setResult(null); setScenario("C");
     // Only the fallback loan has to be admissible; the oversized one is meant to be refused.
     const loan = planC(p, p.principal);
@@ -309,7 +321,7 @@ export function useLending() {
       }
     } catch (e: any) { fail(e); }
     finally { setRunning(false); }
-  }, [params, snap, refresh, doFlow, setStep, precheck, fail]);
+  }, [paramsBy, snap, refresh, doFlow, setStep, precheck, fail]);
 
   // Scenario D — harness ③ history-linked cover rate
   const runD = useCallback(async () => {
@@ -352,17 +364,17 @@ export function useLending() {
    *  progress, result and the transaction log — so picking a scenario again starts from a
    *  clean screen instead of reading as a continuation of the last one. */
   const backToPicker = useCallback(() => {
-    setScenario(null); setResult(null); setScenarioSub("");
+    setScenario(null); setSelected(null); setResult(null); setScenarioSub("");
     setSteps([]); setStep(0); setDefaulted(false); setFlow(null); setLog([]);
   }, [setStep]);
 
   return {
     phase, account, deployed, setupBusy, setupStatus,
-    params, setParam, resetParams,
+    params: paramsBy[selected ?? "A"], setParam, resetParams, selected, selectScenario,
     harnessToggle, setHarnessToggle,
     snap, scenario, scenarioSub, steps, stepIndex, running, flow, defaulted, result, log, countdownMsg,
     connect, setup, forget, runA, runB, runC, runD, backToPicker,
-    bigLoan: bigLoanPrincipal(snap, params),
+    bigLoan: bigLoanPrincipal(snap, paramsBy.C),
     sweep, sweeping, sweepMsg,
     addrs: () => client().addrs(),
   };
